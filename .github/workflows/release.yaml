@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: 'nightly'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+      date: ${{ steps.version.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        shell: bash
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          current_date=$(date +%Y.%m.%d)
+          if [[ "${{ github.event.inputs.nightly }}" == 'true' ]]; then
+            version=$short_sha
+          else
+            version=$current_date
+          fi
+          echo "version $version"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
+          echo "date=$current_date" >> $GITHUB_OUTPUT
+
+  build:
+    name: build-${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            asset: yt-dlp-gui-win64.zip
+          - name: linux
+            os: ubuntu-22.04  # older glibc runs on more distributions
+            asset: yt-dlp-gui-linux64.tar.gz
+          - name: macos
+            os: macos-latest  # Apple Silicon
+            asset: yt-dlp-gui-macos-arm64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install -r requirements-dev.txt
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            # yt-dlp's PyInstaller build triggers fewer antivirus false positives
+            pip install -U "https://github.com/yt-dlp/Pyinstaller-Builds/releases/download/2025.09.13.221251/pyinstaller-6.16.0-py3-none-win_amd64.whl"
+          else
+            pip install pyinstaller==6.16.0
+          fi
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Set version
+        run: python -c "import re, pathlib; p = pathlib.Path('app/app.py'); p.write_text(re.sub(r'(?m)^__version__.*', '__version__ = \"${{ needs.version.outputs.version }}\"', p.read_text(encoding='utf-8')), encoding='utf-8')"
+
+      - name: Build application
+        working-directory: ./app
+        run: pyinstaller --clean -y yt-dlp-gui.spec
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        working-directory: ./app
+        run: Compress-Archive -Path dist/* -DestinationPath ./${{ matrix.asset }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        working-directory: ./app/dist
+        run: tar -czf ../${{ matrix.asset }} yt-dlp-gui
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        working-directory: ./app/dist
+        run: ditto -c -k --keepParent yt-dlp-gui ../${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ./app/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        if: ${{ github.event.inputs.nightly == 'true' }}
+        with:
+          tag_name: nightly
+          body: nightly build - ${{ needs.version.outputs.date }} - [${{ needs.version.outputs.short_sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          generate_release_notes: false
+          draft: false
+          prerelease: true
+          files: dist/*
+
+      - uses: softprops/action-gh-release@v2
+        if: ${{ github.event.inputs.nightly == 'false' }}
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: dist/*
